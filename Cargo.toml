@@ -9,6 +9,21 @@ readme = "README.md"
 keywords = ["conlang", "linguistics", "phonology", "sound-change", "lexurgy"]
 categories = ["command-line-utilities", "science"]
 
+# vendor/ is the Kotlin reference submodule (20 MB), needed only for the
+# differential tests and benches; the tests/ and examples/ here read from it
+# too, so they can't run from a published crate. None are needed to build the
+# library or the CLI binary.
+exclude = [
+    "vendor",
+    "tests",
+    "examples",
+    "docs",
+    "coverage.sh",
+    "Justfile",
+    ".github",
+    ".gitmodules",
+]
+
 [dependencies]
 lalrpop-util = "0.23"
 rayon = "1.10"

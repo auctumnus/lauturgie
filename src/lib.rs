@@ -5,8 +5,9 @@
 
 //! lauturgie: a Rust implementation of the Lexurgy sound change language.
 //!
-//! This crate currently provides the parser: a hand-rolled lexer
-//! ([`lexer`]) plus a lalrpop grammar, producing the AST in [`ast`].
+//! Parse a `.lsc` ruleset with [`parse`], lower it with [`compiler::compile`],
+//! and apply the resulting `CompiledRules` to words. See the crate README for
+//! a worked example.
 
 pub mod compiler;
 pub mod fst;
