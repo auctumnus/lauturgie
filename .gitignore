@@ -1,0 +1,4 @@
+/target
+/fuzz_findings*
+/flamegraph-*.svg
+*.log

@@ -1,0 +1,3 @@
+[submodule "vendor/lexurgy"]
+	path = vendor/lexurgy
+	url = https://github.com/auctumnus/lexurgy

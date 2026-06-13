@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) Autumn <auctumnus@pm.me>
+
+//! lalrpop grammar for Lsc, converted from lexurgy's ANTLR `Lsc.g4`.
+//!
+//! Operates on the marker-annotated token stream produced by
+//! `crate::parser::lexer::lex`. See `docs/parser-notes.md` for how the conversion
+//! works and where it deliberately deviates from ANTLR.
+
+use crate::parser::lexer::token::Tok;
+use crate::parser::lexer::LexError;
+use crate::parser::ast;
+use crate::parser::ast::*;
+use crate::parser::util::{seq_of, join_rule_name, reinterpret_env};
+use lalrpop_util::ParseError;
+use smol_str::SmolStr;
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = LexError;
+
+    enum Tok {
+        "@stmt" => Tok::MarkStmt,
+        "@texpr" => Tok::MarkTopExpr,
+        "@expr" => Tok::MarkExpr,
+        "@btype" => Tok::MarkBlockType,
+        "@syll" => Tok::MarkSyll,
+        "@syllmode" => Tok::MarkSyllMode,
+        "@end" => Tok::MarkEnd,
+        "nl" => Tok::Newline,
+        "ws" => Tok::Ws,
+        "," => Tok::ListSep,
+        ",nl" => Tok::ClassSep,
+        "=>" => Tok::Change,
+        "/" => Tok::Condition,
+        "//" => Tok::Exclusion,
+        "_" => Tok::Anchor,
+        "(" => Tok::OParen,
+        ")" => Tok::CParen,
+        "*" => Tok::Star,
+        "[" => Tok::MatrixStart,
+        "]" => Tok::MatrixEnd,
+        "{" => Tok::ListStart,
+        "{nl" => Tok::ClassStart,
+        "}" => Tok::ListEnd,
+        "+" => Tok::Plus,
+        "?" => Tok::Question,
+        "-" => Tok::Hyphen,
+        ":" => Tok::Colon,
+        "::" => Tok::DoubleColon,
+        "?:" => Tok::QmarkColon,
+        "~" => Tok::Tilde,
+        "!" => Tok::Bang,
+        "." => Tok::Dot,
+        "$" => Tok::Dollar,
+        "$$" => Tok::DollarDollar,
+        "@" => Tok::At,
+        "&" => Tok::Amp,
+        "&!" => Tok::AmpBang,
+        ">" => Tok::Greater,
+        "element" => Tok::KwElement(<SmolStr>),
+        "class" => Tok::KwClass(<SmolStr>),
+        "feature" => Tok::KwFeature(<SmolStr>),
+        "diacritic" => Tok::KwDiacritic(<SmolStr>),
+        "symbol" => Tok::KwSymbol(<SmolStr>),
+        "syllables" => Tok::KwSyllables(<SmolStr>),
+        "explicit" => Tok::KwExplicit(<SmolStr>),
+        "clear" => Tok::KwClear(<SmolStr>),
+        "deromanizer" => Tok::KwDeromanizer(<SmolStr>),
+        "romanizer" => Tok::KwRomanizer(<SmolStr>),
+        "then" => Tok::KwThen(<SmolStr>),
+        "else" => Tok::KwElse(<SmolStr>),
+        "literal" => Tok::KwLiteral(<SmolStr>),
+        "ltr" => Tok::KwLtr(<SmolStr>),
+        "rtl" => Tok::KwRtl(<SmolStr>),
+        "propagate" => Tok::KwPropagate(<SmolStr>),
+        "cleanup" => Tok::KwCleanup(<SmolStr>),
+        "defer" => Tok::KwDefer(<SmolStr>),
+        "unchanged" => Tok::KwUnchanged(<SmolStr>),
+        "off" => Tok::KwOff(<SmolStr>),
+        "(syllable)" => Tok::SyllableFeature,
+        "(before)" => Tok::DiaBefore,
+        "(first)" => Tok::DiaFirst,
+        "(floating)" => Tok::DiaFloating,
+        "<syl>" => Tok::AnySyllable,
+        "number" => Tok::Number(<SmolStr>),
+        "name" => Tok::Name(<SmolStr>),
+        "str" => Tok::Str(<SmolStr>),
+    }
+}
+
+// File structure
+
+pub File: Vec<Statement> = <Item*>;
+
+Item: Statement = {
+    "@stmt" <Statement>,
+    "@texpr" <StandardExpressionRule> => Statement::Expression(<>),
+};
+
+Statement: Statement = {
+    FeatureDecl,
+    DiacriticDecl,
+    SymbolDecl,
+    ClassDecl,
+    ElementDecl,
+    SyllableDecl,
+    Deromanizer,
+    InterRomanizer,
+    Romanizer,
+    ChangeRule,
+};
+
+// Declarations
+
+FeatureDecl: Statement = {
+    "feature" "ws" <first:PlusFeature> <rest:("," <PlusFeature>)*> => {
+        let mut features = vec![first];
+        features.extend(rest);
+        Statement::Feature(FeatureDecl::Plus(features))
+    },
+    "feature" "ws" <syl:SylMod?> <name:NameLike> "ws"? "("
+        <alias:NullAlias?> <first:NameLike> <rest:("," <NameLike>)*> ")" =>
+    {
+        let mut values = vec![first];
+        values.extend(rest);
+        Statement::Feature(FeatureDecl::Full {
+            syllable: syl.is_some(),
+            name,
+            null_alias: alias,
+            values,
+        })
+    },
+};
+
+SylMod: () = "(syllable)" "ws" => ();
+
+PlusFeature: PlusFeature = <syl:SylMod?> <plus:"+"?> <name:NameLike> =>
+    PlusFeature { syllable: syl.is_some(), plus: plus.is_some(), name };
+
+NullAlias: SmolStr = "*" <NameLike> ",";
+
+DiacriticDecl: Statement = "diacritic" "ws" <text:Text> "ws"
+    <pre:(<DiaMod> "ws")*> <matrix:Matrix> <post:("ws" <DiaMod>)*> =>
+{
+    let mut modifiers = pre;
+    modifiers.extend(post);
+    Statement::Diacritic(DiacriticDecl { text, modifiers, matrix })
+};
+
+DiaMod: DiacriticModifier = {
+    "(before)" => DiacriticModifier::Before,
+    "(first)" => DiacriticModifier::First,
+    "(floating)" => DiacriticModifier::Floating,
+};
+
+SymbolDecl: Statement = {
+    "symbol" "ws" <first:Text> <rest:("," <Text>)*> => {
+        let mut names = vec![first];
+        names.extend(rest);
+        Statement::Symbol { names, matrix: None }
+    },
+    "symbol" "ws" <name:Text> "ws" <matrix:Matrix> =>
+        Statement::Symbol { names: vec![name], matrix: Some(matrix) },
+};
+
+ClassDecl: Statement = "class" "ws" <name:NameLike> "ws" ClassOpen
+    <first:ClassElement> <rest:(ClassSep <ClassElement>)*> ClassTrailing? "}" =>
+{
+    let mut elements = vec![first];
+    elements.extend(rest);
+    Statement::Class { name, elements }
+};
+
+ClassOpen: () = { "{" => (), "{nl" => () };
+ClassSep: () = { "," => (), ",nl" => () };
+ClassTrailing: () = { ",nl" => (), "nl" => () };
+
+ClassElement: ClassElement = {
+    "@" <NameLike> => ClassElement::ElementRef(<>),
+    <Text> => ClassElement::Text(<>),
+};
+
+ElementDecl: Statement = "element" "ws" <name:NameLike> "ws" <element:RuleElementRule> =>
+    Statement::Element { name, element };
+
+// Syllables
+
+SyllableDecl: Statement = {
+    "syllables" ":" "@syllmode" "explicit" => Statement::Syllables(SyllableSpec::Explicit),
+    "syllables" ":" "@syllmode" "clear" => Statement::Syllables(SyllableSpec::Clear),
+    "syllables" ":" <patterns:("@syll" <SyllableExpression>)+> =>
+        Statement::Syllables(SyllableSpec::Patterns(patterns)),
+};
+
+SyllableExpression: SyllableExpression = {
+    <pattern:StructuredPattern> <assign:("=>" <Matrix>)?> <environment:CompoundEnv?> =>
+        SyllableExpression { pattern, assign, environment },
+    <s:Seq> <assign:("=>" <Matrix>)?> <environment:CompoundEnv?> => SyllableExpression {
+        pattern: SyllablePattern::Plain(RuleElement::from(s)),
+        assign,
+        environment,
+    },
+    // The pattern's own environment may come before `=>` (e.g.
+    // `@cons? @vowel / _ $ => [heavy]`).
+    <s:Seq> <e:CompoundEnv> "=>" <m:Matrix> <environment:CompoundEnv?> => SyllableExpression {
+        pattern: SyllablePattern::Plain(RuleElement { element: s, environment: Some(e) }),
+        assign: Some(m),
+        environment,
+    },
+};
+
+StructuredPattern: SyllablePattern = {
+    <onset:(<Seq> "?:")?> <a:Seq> "::" <b:Seq> <c:("::" <Seq>)?> => {
+        let mut parts = vec![a, b];
+        parts.extend(c);
+        SyllablePattern::Structured { reluctant_onset: onset, parts }
+    },
+};
+
+// Romanizers and rules
+
+Deromanizer: Statement = "deromanizer" <lit:("ws" "literal")?> ":" "@expr" <block:Block> =>
+    Statement::Deromanizer { literal: lit.is_some(), block };
+
+Romanizer: Statement = "romanizer" <lit:("ws" "literal")?> ":" "@expr" <block:Block> =>
+    Statement::Romanizer { literal: lit.is_some(), block };
+
+InterRomanizer: Statement =
+    "romanizer" "-" <name:InterRomanizerName> <lit:("ws" "literal")?> ":" "@expr" <block:Block> =>
+        Statement::InterRomanizer { name, literal: lit.is_some(), block };
+
+// After `romanizer-` there is no clash with the declaration productions, so
+// the name may start with any word, mirroring ANTLR's full `name` rule
+// (`romanizer-syllables:` is an intermediate romanizer named "syllables").
+InterRomanizerName: SmolStr = <head:NameLike> <tail:("-" <RuleNamePart>)*> =>
+    join_rule_name(head, tail);
+
+ChangeRule: Statement =
+    <name:RuleName> <modifiers:("ws" <RuleModifier>)*> ":"? "@expr" <block:Block> =>
+        Statement::Rule(ast::ChangeRule { name, modifiers, block });
+
+RuleModifier: RuleModifier = {
+    "@" <NameLike> => RuleModifier::Filter(Element::ElementRef(<>)),
+    <FancyMatrix> => RuleModifier::Filter(Element::Matrix(<>)),
+    "ltr" => RuleModifier::Ltr,
+    "rtl" => RuleModifier::Rtl,
+    "propagate" => RuleModifier::Propagate,
+    "defer" => RuleModifier::Defer,
+    "cleanup" => RuleModifier::Cleanup,
+    <"name"> => RuleModifier::Name(<>),
+};
+
+RuleName: SmolStr = <head:RuleNameHead> <tail:("-" <RuleNamePart>)*> =>
+    join_rule_name(head, tail);
+
+// A rule name's first word. Statement position must not admit declaration
+// keywords (they'd conflict with the declaration productions); the line
+// classifier relabels those to plain names when they aren't declarations.
+RuleNameHead: SmolStr = {
+    <"name">,
+    <"then">, <"else">, <"literal">, <"ltr">, <"rtl">, <"propagate">,
+    <"cleanup">, <"defer">, <"unchanged">, <"off">, <"explicit">, <"clear">,
+};
+
+RuleNamePart: SmolStr = { <NameLike>, <"number"> };
+
+// Any word usable as a name, mirroring the ANTLR `name` rule: keywords are
+// contextual and double as names everywhere except where the line classifier
+// has already decided otherwise.
+NameLike: SmolStr = {
+    <"name">,
+    <"element">, <"class">, <"feature">, <"diacritic">, <"symbol">,
+    <"syllables">, <"explicit">, <"clear">, <"deromanizer">, <"romanizer">,
+    <"then">, <"else">, <"literal">, <"ltr">, <"rtl">, <"propagate">,
+    <"cleanup">, <"defer">, <"unchanged">, <"off">,
+};
+
+// Blocks and expressions
+
+Block: Block = <first:BlockElement> <rest:BlockCont*> => Block { first, rest };
+
+BlockCont: (BlockType, BlockElement) =
+    "@btype" <kind:BlockKindT> <modifiers:("ws" <RuleModifier>)*> ":" WsOrExpr <el:BlockElement> =>
+        (BlockType { kind, modifiers }, el);
+
+BlockKindT: BlockKind = {
+    "then" => BlockKind::Then,
+    "else" => BlockKind::Else,
+};
+
+WsOrExpr: () = { "ws" => (), "@expr" => () };
+
+BlockElement: BlockElement = {
+    <ExpressionList> => BlockElement::Expressions(<>),
+    // Multi-line parenthesized block: `(` followed by a line break.
+    "(" "@expr" <b:Block> "@end"? ")" => BlockElement::Nested(Box::new(b)),
+    // Single-line parenthesized block. Restricted to non-keyword expressions:
+    // `(unchanged)` on one line would be ambiguous with a text element group.
+    "(" <first:InlineNestedExpr> <more:("@expr" <Expression>)*> <rest:BlockCont*> "@end"? ")" => {
+        let mut exprs = vec![first];
+        exprs.extend(more);
+        BlockElement::Nested(Box::new(Block {
+            first: BlockElement::Expressions(exprs),
+            rest,
+        }))
+    },
+};
+
+ExpressionList: Vec<Expression> = <first:Expression> <rest:("@expr" <Expression>)*> => {
+    let mut exprs = vec![first];
+    exprs.extend(rest);
+    exprs
+};
+
+Expression: Expression = {
+    "unchanged" => Expression::Unchanged,
+    "off" => Expression::Off,
+    <InlineNestedExpr>,
+};
+
+InlineNestedExpr: Expression = {
+    ":" <RuleName> => Expression::BlockRef(<>),
+    <StandardExpressionRule> => Expression::Standard(<>),
+};
+
+StandardExpressionRule: StandardExpression =
+    <from:RuleElementRule> "=>" <to:Seq> <environment:CompoundEnv?> =>
+        StandardExpression { from, to, environment };
+
+// Rule elements
+
+RuleElementRule: RuleElement = <element:Seq> <environment:CompoundEnv?> =>
+    RuleElement { element, environment };
+
+// A whitespace-separated sequence. `SeqCore` is the shared left-recursive
+// spine: environment rules extend it directly (`SeqCore "ws" "_"`) so the
+// parser never has to decide "sequence continues vs. anchor follows" before
+// seeing the token after the whitespace.
+Seq: Element = <SeqCore> => seq_of(<>);
+
+SeqCore: Vec<Element> = {
+    <f:Free> => vec![f],
+    <mut s:SeqCore> "ws" <f:Free> => {
+        s.push(f);
+        s
+    },
+};
+
+Free: Element = {
+    <Postfixy>,
+    <first:Postfixy> <rest:(InterfixPart)+> =>
+        Element::Interfix { first: Box::new(first), rest },
+};
+
+InterfixPart: (InterfixKind, Element) = <k:InterfixOp> <e:Postfixy> => (k, e);
+
+InterfixOp: InterfixKind = {
+    "&" => InterfixKind::Intersection,
+    "&!" => InterfixKind::IntersectionNot,
+    ">" => InterfixKind::Transforming,
+};
+
+Postfixy: Element = {
+    <Primary>,
+    <e:Primary> <capture:CaptureRefT> =>
+        Element::Capture { element: Box::new(e), capture },
+    <e:Primary> <kind:RepeaterType> =>
+        Element::Repeat { element: Box::new(e), kind },
+    <NegatedEl>,
+    <e:NegatedEl> <capture:CaptureRefT> =>
+        Element::Capture { element: Box::new(e), capture },
+};
+
+NegatedEl: Element = "!" <Primary> => Element::Negated(Box::new(<>));
+
+Primary: Element = { <Bounded>, <SimpleEl> };
+
+Bounded: Element = {
+    "(" <e:RuleElementRule> ")" => Element::Group(Box::new(e)),
+    "{" <first:ListItem> <rest:("," <ListItem>)*> "}" => {
+        let mut items = vec![first];
+        items.extend(rest);
+        Element::List(items)
+    },
+};
+
+// Cover item: an alternative (rule element) or an anchored environment.
+// Anchored items are only meaningful where the list is reinterpreted as an
+// environment list; `crate::validate` rejects them anywhere else.
+ListItem: ListItem = {
+    <RuleElementRule> => ListItem::Element(<>),
+    <s:SeqCore> "ws" "_" <after:EnvAfter?> => ListItem::Env(Environment {
+        before: Some(seq_of(s)),
+        anchored: true,
+        after,
+    }),
+    "_" <after:EnvAfter?> => ListItem::Env(Environment {
+        before: None,
+        anchored: true,
+        after,
+    }),
+    () => ListItem::Env(Environment { before: None, anchored: false, after: None }),
+};
+
+SimpleEl: Element = {
+    "<syl>" => Element::AnySyllable,
+    "@" <NameLike> => Element::ElementRef(<>),
+    <CaptureRefT> => Element::CaptureRef(<>),
+    <FancyMatrix> => Element::Matrix(<>),
+    "*" => Element::Empty,
+    "." => Element::SyllableBoundary,
+    "$" => Element::WordBoundary,
+    "$$" => Element::BetweenWords,
+    <Text> => Element::Text(<>),
+};
+
+Text: Text = <text:TextWord> <exact:"!"?> => ast::Text { text, exact: exact.is_some() };
+
+TextWord: SmolStr = { <NameLike>, <"str"> };
+
+CaptureRefT: CaptureRef = <inexact:"~"?> "$" <syl:"."?> <number:Num> => CaptureRef {
+    inexact: inexact.is_some(),
+    syllable: syl.is_some(),
+    number,
+};
+
+RepeaterType: RepeaterKind = {
+    "+" => RepeaterKind::AtLeastOne,
+    "?" => RepeaterKind::Optional,
+    "*" => RepeaterKind::ZeroOrMore,
+    "*" <n:Num> => RepeaterKind::Count(n),
+    "*" "(" <min:Num?> "-" <max:Num?> ")" => RepeaterKind::Range { min, max },
+};
+
+Num: u32 = <l:@L> <s:"number"> =>? s.parse().map_err(|_| ParseError::User {
+    error: LexError { pos: l, message: format!("number out of range: {s}") },
+});
+
+// Matrices
+
+// Plain matrix (declarations, syllable feature assignment).
+Matrix: Matrix = "[" <vals:MatrixVals?> "]" => vals.unwrap_or_default();
+
+MatrixVals: Matrix = <first:MatrixValueP> <rest:("ws" <MatrixValueP>)*> => {
+    let mut vals = vec![first];
+    vals.extend(rest);
+    vals
+};
+
+MatrixValueP: MatrixValue = <v:PlainValueKind> => MatrixValue { negated: false, value: v };
+
+PlainValueKind: MatrixValueKind = {
+    "+" <NameLike> => MatrixValueKind::Plus(<>),
+    "-" <NameLike> => MatrixValueKind::Minus(<>),
+    <NameLike> => MatrixValueKind::Simple(<>),
+};
+
+// "Fancy" matrix (inside rule elements): negation, absent features, variables.
+FancyMatrix: Matrix = "[" <vals:FancyVals?> "]" => vals.unwrap_or_default();
+
+FancyVals: Matrix = <first:FancyValue> <rest:("ws" <FancyValue>)*> => {
+    let mut vals = vec![first];
+    vals.extend(rest);
+    vals
+};
+
+FancyValue: MatrixValue = <neg:"!"?> <value:FancyValueKind> =>
+    MatrixValue { negated: neg.is_some(), value };
+
+FancyValueKind: MatrixValueKind = {
+    <PlainValueKind>,
+    "*" <NameLike> => MatrixValueKind::Absent(<>),
+    "$" <NameLike> => MatrixValueKind::Variable(<>),
+};
+
+// Environments
+
+CompoundEnv: CompoundEnvironment = {
+    <condition:Cond> <exclusion:Excl?> =>
+        CompoundEnvironment { condition: Some(condition), exclusion },
+    <exclusion:Excl> =>
+        CompoundEnvironment { condition: None, exclusion: Some(exclusion) },
+};
+
+Cond: Vec<Environment> = <l:@L> "/" <e:Environment> =>?
+    reinterpret_env(e).map_err(|message| ParseError::User {
+        error: LexError { pos: l, message },
+    });
+
+Excl: Vec<Environment> = <l:@L> "//" <e:Environment> =>?
+    reinterpret_env(e).map_err(|message| ParseError::User {
+        error: LexError { pos: l, message },
+    });
+
+Environment: Environment = {
+    () => Environment { before: None, anchored: false, after: None },
+    <s:Seq> => Environment { before: Some(s), anchored: false, after: None },
+    <s:SeqCore> "ws" "_" <after:EnvAfter?> => Environment {
+        before: Some(seq_of(s)),
+        anchored: true,
+        after,
+    },
+    "_" <after:EnvAfter?> => Environment { before: None, anchored: true, after },
+};
+
+EnvAfter: Element = "ws" <Seq>;

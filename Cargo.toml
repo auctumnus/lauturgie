@@ -1,0 +1,27 @@
+[package]
+name = "lauturgie"
+version = "0.1.0"
+edition = "2021"
+description = "A fast Rust reimplementation of the Lexurgy sound change applier"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/auctumnus/lauturgie"
+readme = "README.md"
+keywords = ["conlang", "linguistics", "phonology", "sound-change", "lexurgy"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+lalrpop-util = "0.23"
+rayon = "1.10"
+smol_str = "0.3.6"
+unicode-normalization = "0.1.25"
+
+[build-dependencies]
+lalrpop = { version = "0.23", default-features = false }
+
+[dev-dependencies]
+unicode-normalization = "0.1.25"
+pprof = { version = "0.15", features = ["flamegraph"] }
+
+# keep frame pointers / symbols in release so flamegraphs are readable
+[profile.release]
+debug = true
