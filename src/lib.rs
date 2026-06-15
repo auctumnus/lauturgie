@@ -12,6 +12,7 @@
 pub mod compiler;
 pub mod fst;
 pub mod parser;
+pub mod session;
 pub mod vm;
 pub mod word;
 

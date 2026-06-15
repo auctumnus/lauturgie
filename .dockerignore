@@ -1,0 +1,13 @@
+# Build context: only what's needed to compile the server binary. build.rs
+# needs src/lsc.lalrpop, so src/ stays; everything below is test/bench/oracle
+# material or build output that would only bust the cache.
+/target
+/vendor
+/fuzz_findings*
+/flamegraph-*.svg
+/tests
+/examples
+/docs
+*.log
+/.git
+/.github

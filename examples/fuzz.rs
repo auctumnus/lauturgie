@@ -1101,6 +1101,8 @@ fn check_seed(seed: u64, n_words: usize, findings: &mut Vec<Finding>) -> Outcome
     };
     vm.force_vm = true;
 
+    let findings_before = findings.len();
+
     let mut agree_ok = 0;
     let mut agree_err = 0;
     for w in &words {
@@ -1136,6 +1138,53 @@ fn check_seed(seed: u64, n_words: usize, findings: &mut Vec<Finding>) -> Outcome
             break;
         }
     }
+
+    // Also fuzz the session path (`change_with_intermediates`, used by the HTTP
+    // API): it walks the named stage list on the pure VM tier, so its
+    // per-word output must match `vm.apply` (also force_vm) exactly. Only when
+    // the tier loop above found nothing — a tier disagreement would mask this.
+    if findings.len() == findings_before {
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let session = catch_unwind(AssertUnwindSafe(|| {
+            vm.clone()
+                .change_with_intermediates(&refs, &lauturgie::session::ChangeOptions::default())
+        }));
+        match session {
+            Err(p) => findings.push(Finding {
+                kind: "session-panic",
+                detail: format!("{}\n---\n{lsc}", panic_msg(p)),
+            }),
+            // A whole-run session error (unparsable input word) doesn't line up
+            // word-for-word with per-word apply; skip those rare cases.
+            Ok(Err(_)) => {}
+            Ok(Ok(out)) => {
+                for (w, got) in words.iter().zip(&out.output_words) {
+                    let want = match catch_unwind(AssertUnwindSafe(|| vm.apply(w))) {
+                        Ok(Ok(x)) => x,
+                        Ok(Err(_)) => "ERROR".to_string(),
+                        // vm panicked but session didn't: surface it.
+                        Err(p) => {
+                            findings.push(Finding {
+                                kind: "session-vm-panic",
+                                detail: format!("word: {w:?}\n{}\n---\n{lsc}", panic_msg(p)),
+                            });
+                            break;
+                        }
+                    };
+                    if *got != want {
+                        findings.push(Finding {
+                            kind: "session-mismatch",
+                            detail: format!(
+                                "word: {w:?}\nsession: {got:?}\nvm:      {want:?}\n---\n{lsc}"
+                            ),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     Outcome::Ran {
         agree_ok,
         agree_err,

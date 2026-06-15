@@ -31,6 +31,7 @@ pub mod pairing;
 pub mod segments;
 
 use crate::ast;
+use smol_str::SmolStr;
 
 /// A compilation failure. These correspond to lexurgy's `Lsc*` user errors
 /// (`LscUndefinedName`, `LscDuplicateName`, ...) so that error behavior can
@@ -63,6 +64,29 @@ pub enum CompileError {
     /// An expression whose `from => to` pairing lexurgy rejects at rule
     /// build time (`InvalidTransformation` / `LscIllegalStructure`).
     Expression { rule: String, what: String },
+}
+
+impl CompileError {
+    /// Attribute an error that arose while lowering a *rule* body to that
+    /// rule, so the API can report it as an `invalidExpression` (lexurgy's
+    /// `LscInvalidRuleExpression`: any error linking a rule's expression
+    /// carries the rule name). Declaration errors are raised in
+    /// `decls::resolve` and never pass through here, so they stay analysis
+    /// errors. Already-attributed (`Expression`) errors are left untouched.
+    pub fn in_rule(self, rule: &str) -> CompileError {
+        match self {
+            // Already attributed, or a *structural* error that lexurgy reports
+            // as a plain analysis error rather than an invalid expression
+            // (e.g. `LscMixedBlock` — a `Then:`/`Else:` mix). Expression-level
+            // errors (undefined names, bad matrices, …) are the ones that
+            // become `LscInvalidRuleExpression`.
+            CompileError::Expression { .. } | CompileError::Invalid { .. } => self,
+            other => CompileError::Expression {
+                rule: rule.to_string(),
+                what: other.to_string(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for CompileError {
@@ -138,6 +162,53 @@ pub enum Step {
     StripBreaks,
 }
 
+/// A *named* pipeline stage, mirroring lexurgy's `SequencedRule` granularity
+/// (one entry per `ApplyRule`/`Syllabify`/`CleanUp`/`IntermediateRomanize`).
+///
+/// The flat [`Step`] list is finer-grained than this — a literal deromanizer
+/// is one `<deromanizer>` stage spanning two `Step::Rule`s plus a re-parse —
+/// so stages are what `rule_names`, tracing, `startAt`/`stopBefore`, and
+/// intermediate-romanizer capture work over. The `apply` fast path ignores
+/// them entirely; only the session path ([`crate::session`]) walks them.
+#[derive(Debug, Clone)]
+pub struct Stage {
+    /// The name used in `ruleNames` and tracing (`foo`, `<deromanizer>`,
+    /// `<syllables>/foo/1`, `<cleanup>/foo/bar`, `<romanizer>-x`).
+    pub name: SmolStr,
+    pub kind: StageKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum StageKind {
+    /// A normal rule, deromanizer, or final romanizer (lexurgy's `ApplyRule`):
+    /// the only kind `startAt`/`stopBefore` can name. Runs `steps` on the
+    /// main word stream.
+    Rule { steps: std::ops::Range<usize> },
+    /// A `Syllables:` (re-)application. Mutates the stream; the `startAt`
+    /// back-up-by-one quirk keys off this kind.
+    Syllabify { steps: std::ops::Range<usize> },
+    /// A persistent `cleanup` rule application. Mutates the stream but is
+    /// not nameable by `startAt`/`stopBefore`.
+    Cleanup { steps: std::ops::Range<usize> },
+    /// An intermediate romanizer: runs `steps` on a *copy* of the stream and
+    /// renders it into the intermediates map under `stage_name` (the bare
+    /// name, without the `<romanizer>-` prefix). Does not mutate the stream.
+    IntermediateRomanize {
+        stage_name: SmolStr,
+        steps: Vec<Step>,
+    },
+}
+
+impl StageKind {
+    /// `startAt`/`stopBefore` only match `Rule` stages (lexurgy's `ApplyRule`).
+    pub fn is_rule(&self) -> bool {
+        matches!(self, StageKind::Rule { .. })
+    }
+    pub fn is_syllabify(&self) -> bool {
+        matches!(self, StageKind::Syllabify { .. })
+    }
+}
+
 /// A compiled sound changer: everything the VM needs to run words.
 ///
 /// `rules` is the lowered IR; tier selection and codegen will turn it into
@@ -152,6 +223,10 @@ pub struct CompiledRules {
     pub rules: Vec<ir::RuleIr>,
     pub syllabifiers: Vec<ir::SyllabifierIr>,
     pub steps: Vec<Step>,
+    /// Named stages mirroring lexurgy's `SequencedRule` list (see [`Stage`]).
+    /// Drives `rule_names`, tracing, `startAt`/`stopBefore`, and
+    /// intermediate-romanizer capture in the session path.
+    pub stages: Vec<Stage>,
     /// How input words are parsed (set by a literal deromanizer and by an
     /// initial `Syllables:` declaration).
     pub input_universe: Universe,
@@ -174,6 +249,14 @@ pub struct CompiledRules {
     /// Force the VM tier even where an FST exists (for differential
     /// testing of the tiers against each other).
     pub force_vm: bool,
+}
+
+impl CompiledRules {
+    /// The rule names used in tracing output, in application order — lexurgy's
+    /// `SoundChanger.ruleNames`. One entry per [`Stage`].
+    pub fn rule_names(&self) -> Vec<String> {
+        self.stages.iter().map(|s| s.name.to_string()).collect()
+    }
 }
 
 /// Compile a parsed sound-change file.

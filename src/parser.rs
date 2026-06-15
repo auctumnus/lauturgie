@@ -5,7 +5,7 @@ pub mod ast;
 pub mod lexer;
 
 mod util;
-mod validate;
+pub(crate) mod validate;
 
 use lalrpop_util::lalrpop_mod;
 
@@ -41,6 +41,45 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The byte offset a parse/lex error points at, if any. `Invalid`
+    /// (post-parse structural) errors have no single location.
+    pub fn offset(&self) -> Option<usize> {
+        use lalrpop_util::ParseError as P;
+        match self {
+            Error::Lex(e) => Some(e.pos),
+            Error::Parse(e) => Some(match e.as_ref() {
+                P::InvalidToken { location } => *location,
+                P::UnrecognizedEof { location, .. } => *location,
+                P::UnrecognizedToken { token: (start, ..), .. } => *start,
+                P::ExtraToken { token: (start, ..) } => *start,
+                P::User { error } => error.pos,
+            }),
+            Error::Invalid(_) => None,
+        }
+    }
+}
+
+/// Convert a byte offset into a (line, column) pair, both 1-based, for error
+/// reporting (lexurgy's `LscNotParsable.line`/`.column`).
+pub fn line_col(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let mut line = 1;
+    let mut col = 1;
+    for (i, ch) in source.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
 
 impl From<RawParseError> for Error {
     fn from(e: RawParseError) -> Self {

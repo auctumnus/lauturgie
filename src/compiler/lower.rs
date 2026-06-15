@@ -30,7 +30,7 @@ use super::ir::{
     SylExprIr, SylPatternIr, SyllabifierIr, TextIr,
 };
 use super::segments::{syl_mods_test, DiacriticMask, SegmentId, SegmentInterner};
-use super::{CompileError, CompiledRules, Step, Universe};
+use super::{CompileError, CompiledRules, Stage, StageKind, Step, Universe};
 use crate::ast;
 use crate::word::Word;
 
@@ -67,14 +67,23 @@ enum Anchored {
     Syllabify(Option<usize>),
     /// Intermediate romanizers don't touch the main word stream (their
     /// output goes to a separate stage map), but their *position* matters
-    /// for sequencing.
-    InterRomanizer,
+    /// for sequencing. `name` is the `ruleNames` entry (`<romanizer>-x`),
+    /// `stage_name` the bare intermediates-map key (`x`), and `steps` the
+    /// romanizer's own pipeline (run on a copy of the stream).
+    InterRomanizer {
+        name: SmolStr,
+        stage_name: SmolStr,
+        steps: Vec<Step>,
+    },
 }
 
 /// One rule plus the anchored statements preceding it. `steps` is the
 /// rule's own pipeline footprint: usually one `Step::Rule` + strip, empty
 /// for the trailing virtual rule, several steps for literal romanizers.
 struct Entry {
+    /// The `ApplyRule` name for this entry's rule (`foo`, `<deromanizer>`,
+    /// `<romanizer>`). Empty for the trailing virtual rule (no stage).
+    name: SmolStr,
     steps: Vec<Step>,
     anchored: Vec<Anchored>,
     is_romanizer: bool,
@@ -133,19 +142,24 @@ impl Build {
                         continue;
                     }
                     if has_modifier(rule, ast::RuleModifier::Defer) {
-                        // A duplicate deferred-rule name is *not* an error:
-                        // kotlin's `resolveBlocks` does
-                        // `blocks.associate { it.rule.name to it.rule }`, and
-                        // `associate` keeps the last, so the last declaration
-                        // wins (unlike a plain rule, where a duplicate name is
-                        // rejected). We still validate every body eagerly:
-                        // kotlin walks all rules (catching structural errors
-                        // like a `>` transforming emit) before deduping, and
-                        // our lowering is the only structural check we have, so
-                        // eager validation is the faithful (and safe) choice
-                        // even though it also rejects undefined-name/count
-                        // errors that kotlin would only catch lazily at link.
-                        self.lower_rule_body(rule, Universe::Real)?;
+                        // A deferred rule is a template, not a pipeline step: it
+                        // is lowered (and thus validated) only where `:name`
+                        // splices it (`lower_block_element` /
+                        // `lower_expression_into`). We must NOT validate the body
+                        // here. Kotlin compiles a `defer`d rule lazily at its
+                        // splice, so a never-spliced deferred rule with an invalid
+                        // body (a peripheral repeater, a matrix with two values of
+                        // one feature, a nested env or `~$` in output, an
+                        // undefined name, a mismatched `=>` count, ...) is
+                        // *accepted*, not rejected — eager validation here was 18
+                        // of the kotlin-oracle fuzz's findings, all unspliced
+                        // deferred rules (kotlin-CLI-verified: bad-defer-unspliced
+                        // accepts, the same body spliced rejects). A duplicate
+                        // deferred-rule name is likewise not an error: kotlin's
+                        // `resolveBlocks` does
+                        // `blocks.associate { it.rule.name to it.rule }`, keeping
+                        // the last, so the last declaration wins (unlike a plain
+                        // rule, where a duplicate name is rejected).
                         self.deferred.insert(rule.name.clone(), (*rule).clone());
                         continue;
                     }
@@ -156,7 +170,9 @@ impl Build {
                         });
                     }
                     rule_names.push(rule.name.clone());
-                    let body = self.lower_rule_body(rule, Universe::Real)?;
+                    let body = self
+                        .lower_rule_body(rule, Universe::Real)
+                        .map_err(|e| e.in_rule(&rule.name))?;
                     let index = self.push_rule(rule.name.clone(), body);
                     if has_modifier(rule, ast::RuleModifier::Cleanup) {
                         cur_anchored.push(Anchored::Cleanup {
@@ -165,6 +181,7 @@ impl Build {
                         });
                     } else {
                         entries.push(Entry {
+                            name: rule.name.clone(),
                             steps: vec![
                                 Step::Rule {
                                     rule: index,
@@ -205,19 +222,28 @@ impl Build {
                     literal,
                     block,
                 } => {
-                    let stage = SmolStr::from(format!("<romanizer>-{name}"));
-                    // Validate against the declarations in force here; the
-                    // stage output isn't part of the single-word pipeline.
-                    self.lower_romanizer_blocks(&stage, *literal, block)?;
-                    // A duplicate inter-romanizer *name* is not an error:
-                    // unlike the deromanizer/final romanizer (kotlin's
+                    let rule_name = SmolStr::from(format!("<romanizer>-{name}"));
+                    // Validate against the declarations in force here (kotlin
+                    // builds inter-romanizer transformers at parse time, so
+                    // their `from => to` count errors are compile errors).
+                    self.lower_romanizer_blocks(&rule_name, *literal, block)
+                        .map_err(|e| e.in_rule(&rule_name))?;
+                    // The session path also *runs* the romanizer (on a copy of
+                    // the stream) to capture its output, so lower it to runnable
+                    // steps too. A duplicate inter-romanizer *name* is not an
+                    // error: unlike the deromanizer/final romanizer (kotlin's
                     // `extractRomanizerContext` uses `singleOrNullOrThrow` →
                     // `LscDuplicateName`), intermediate romanizers are just
                     // collected as a list (`visitInterRomanizer`), so two
-                    // `Romanizer-x:` stages both run. The `<romanizer>-`
-                    // prefix can't collide with a plain rule name either, so
-                    // there's nothing to check here.
-                    cur_anchored.push(Anchored::InterRomanizer);
+                    // `Romanizer-x:` stages both run.
+                    let steps = self
+                        .lower_romanizer_pipeline(rule_name.clone(), *literal, block)
+                        .map_err(|e| e.in_rule(&rule_name))?;
+                    cur_anchored.push(Anchored::InterRomanizer {
+                        name: rule_name,
+                        stage_name: name.clone(),
+                        steps,
+                    });
                 }
                 ast::Statement::Expression(_) => {
                     return Err(CompileError::Invalid {
@@ -227,8 +253,20 @@ impl Build {
                 _ => unreachable!("declaration statement survived resolve()"),
             }
         }
+
+        // lexurgy throws `LscFutureStructure("Transforming elements")` for a
+        // transforming `>` in *any* rule, including a never-spliced deferred
+        // one (it is a compile-stage error, post-parse). The deferred bodies
+        // above are otherwise validated lazily at their splice, but `>` is an
+        // eager reject, so check every collected deferred rule for it now.
+        for rule in self.deferred.values() {
+            crate::parser::validate::reject_deferred_transforming(rule)
+                .map_err(|what| CompileError::Invalid { what }.in_rule(&rule.name))?;
+        }
+
         // Trailing anchored statements attach to a virtual rule at the end.
         entries.push(Entry {
+            name: SmolStr::default(),
             steps: Vec::new(),
             anchored: cur_anchored,
             is_romanizer: false,
@@ -244,7 +282,9 @@ impl Build {
                 // words are parsed with *empty* declarations.
                 input_universe = Universe::Literal;
                 let (first, rest) = split_then_blocks(block);
-                let body = self.lower_block_in(&first, Universe::Literal)?;
+                let body = self
+                    .lower_block_in(&first, Universe::Literal)
+                    .map_err(|e| e.in_rule("<deromanizer>"))?;
                 let index = self.push_rule("<deromanizer>".into(), body);
                 steps.push(Step::Rule {
                     rule: index,
@@ -256,7 +296,9 @@ impl Build {
                 });
                 if let Some(rest) = rest {
                     let prev = std::mem::replace(&mut self.syl_active, initial_syl);
-                    let body = self.lower_block_in(&rest, Universe::Real)?;
+                    let body = self
+                        .lower_block_in(&rest, Universe::Real)
+                        .map_err(|e| e.in_rule("<deromanizer>"))?;
                     self.syl_active = prev;
                     let index = self.push_rule("<deromanizer>".into(), body);
                     steps.push(Step::Rule {
@@ -266,7 +308,9 @@ impl Build {
                 }
             } else {
                 let prev = std::mem::replace(&mut self.syl_active, initial_syl);
-                let body = self.lower_block_in(block, Universe::Real)?;
+                let body = self
+                    .lower_block_in(block, Universe::Real)
+                    .map_err(|e| e.in_rule("<deromanizer>"))?;
                 self.syl_active = prev;
                 let index = self.push_rule("<deromanizer>".into(), body);
                 steps.push(Step::Rule {
@@ -278,6 +322,7 @@ impl Build {
             entries.insert(
                 0,
                 Entry {
+                    name: "<deromanizer>".into(),
                     steps,
                     anchored: Vec::new(),
                     is_romanizer: false,
@@ -285,15 +330,18 @@ impl Build {
             );
         }
         if let Some((literal, block)) = &romanizer {
-            let steps = self.lower_final_romanizer(*literal, block)?;
+            let steps = self
+                .lower_final_romanizer(*literal, block)
+                .map_err(|e| e.in_rule("<romanizer>"))?;
             entries.push(Entry {
+                name: "<romanizer>".into(),
                 steps,
                 anchored: Vec::new(),
                 is_romanizer: true,
             });
         }
 
-        let steps = sequence(entries);
+        let (steps, stages) = sequence(entries);
         Ok(CompiledRules {
             decls: self.decls,
             segments: self.segments,
@@ -302,6 +350,7 @@ impl Build {
             rules: self.rules,
             syllabifiers: self.syllabifiers,
             steps,
+            stages,
             input_universe,
             input_syllabified: input_universe == Universe::Real && initial_syl,
             validate_only: self.validate_only,
@@ -343,13 +392,25 @@ impl Build {
         literal: bool,
         block: &ast::Block,
     ) -> Result<Vec<Step>, CompileError> {
+        self.lower_romanizer_pipeline("<romanizer>".into(), literal, block)
+    }
+
+    /// Lower a romanizer block (final or intermediate) into runnable steps.
+    /// Same shape as lexurgy's romanizer rule: a literal romanizer runs its
+    /// last block against empty declarations, bridged by a re-parse.
+    fn lower_romanizer_pipeline(
+        &mut self,
+        name: SmolStr,
+        literal: bool,
+        block: &ast::Block,
+    ) -> Result<Vec<Step>, CompileError> {
         let mut steps = Vec::new();
         if literal {
             // The *last* block runs against empty declarations.
             let (front, last) = split_then_blocks_back(block);
             if let Some(front) = front {
                 let body = self.lower_block_in(&front, Universe::Real)?;
-                let index = self.push_rule("<romanizer>".into(), body);
+                let index = self.push_rule(name.clone(), body);
                 steps.push(Step::Rule {
                     rule: index,
                     universe: Universe::Real,
@@ -360,14 +421,14 @@ impl Build {
                 syllabified: false,
             });
             let body = self.lower_block_in(&last, Universe::Literal)?;
-            let index = self.push_rule("<romanizer>".into(), body);
+            let index = self.push_rule(name, body);
             steps.push(Step::Rule {
                 rule: index,
                 universe: Universe::Literal,
             });
         } else {
             let body = self.lower_block_in(block, Universe::Real)?;
-            let index = self.push_rule("<romanizer>".into(), body);
+            let index = self.push_rule(name, body);
             steps.push(Step::Rule {
                 rule: index,
                 universe: Universe::Real,
@@ -520,8 +581,10 @@ fn split_then_blocks_back(block: &ast::Block) -> (Option<ast::Block>, ast::Block
 }
 
 /// Port of lexurgy's `sequenceRules`: interleave rules with persistent
-/// cleanup and syllabification steps.
-fn sequence(mut entries: Vec<Entry>) -> Vec<Step> {
+/// cleanup and syllabification steps, emitting the flat [`Step`] pipeline and
+/// the parallel named [`Stage`] list (lexurgy's `sequencedRules`, whose names
+/// are `SoundChanger.ruleNames`).
+fn sequence(mut entries: Vec<Entry>) -> (Vec<Step>, Vec<Stage>) {
     // Unless the last entry is a romanizer (or already a virtual rule),
     // append a virtual rule so trailing persistent steps run at the end.
     let needs_trailing = entries
@@ -529,80 +592,149 @@ fn sequence(mut entries: Vec<Entry>) -> Vec<Step> {
         .is_some_and(|e| !e.steps.is_empty() && !e.is_romanizer);
     if needs_trailing {
         entries.push(Entry {
+            name: SmolStr::default(),
             steps: Vec::new(),
             anchored: Vec::new(),
             is_romanizer: false,
         });
     }
 
-    let mut steps: Vec<Step> = Vec::new();
-    let mut persistent_cleanups: Vec<(SmolStr, usize)> = Vec::new();
-    let mut persistent_syllabify: Option<Step> = None;
+    let mut seq = Seq {
+        steps: Vec::new(),
+        stages: Vec::new(),
+        persistent_cleanups: Vec::new(),
+        persistent_syllabify: None,
+        // lexurgy seeds `lastRuleName` with "<initial>" and resets the
+        // syllable counter to 0 after each applied rule.
+        last_rule_name: SmolStr::from("<initial>"),
+        syl_counter: 0,
+    };
 
     for entry in entries {
         // Persistent cleanup rules always run first: before any
         // syllabification, and one last time before being cancelled.
-        for &(_, rule) in &persistent_cleanups {
-            steps.push(Step::Rule {
-                rule,
-                universe: Universe::Real,
-            });
-            steps.push(Step::StripBreaks);
+        for (name, rule) in seq.persistent_cleanups.clone() {
+            seq.push_cleanup(&name, rule);
         }
-        let before_syllabification =
-            if matches!(entry.anchored.first(), Some(Anchored::InterRomanizer)) {
-                0
-            } else {
-                entry.anchored.len().min(1)
-            };
-        let apply = |anchored: &Anchored,
-                     steps: &mut Vec<Step>,
-                     persistent_cleanups: &mut Vec<(SmolStr, usize)>,
-                     persistent_syllabify: &mut Option<Step>| {
-            match anchored {
-                Anchored::Cleanup { name, rule } => {
-                    steps.push(Step::Rule {
-                        rule: *rule,
-                        universe: Universe::Real,
-                    });
-                    steps.push(Step::StripBreaks);
-                    persistent_cleanups.push((name.clone(), *rule));
-                }
-                Anchored::CleanupOff(name) => {
-                    persistent_cleanups.retain(|(n, _)| n != name);
-                }
-                Anchored::Syllabify(index) => {
-                    let step = Step::Syllabify(*index);
-                    steps.push(step);
-                    *persistent_syllabify = Some(step);
-                }
-                Anchored::InterRomanizer => {}
-            }
+        let before_syllabification = if matches!(
+            entry.anchored.first(),
+            Some(Anchored::InterRomanizer { .. })
+        ) {
+            0
+        } else {
+            entry.anchored.len().min(1)
         };
         for anchored in &entry.anchored[..before_syllabification] {
-            apply(
-                anchored,
-                &mut steps,
-                &mut persistent_cleanups,
-                &mut persistent_syllabify,
-            );
+            seq.apply_anchored(anchored);
         }
-        if let Some(syllabify) = persistent_syllabify {
-            if steps.last() != Some(&syllabify) {
-                steps.push(syllabify);
+        if let Some(syllabify) = seq.persistent_syllabify {
+            if seq.steps.last() != Some(&syllabify) {
+                let Step::Syllabify(index) = syllabify else {
+                    unreachable!("persistent_syllabify is always a Syllabify step")
+                };
+                seq.push_syllabify(index);
             }
         }
         for anchored in &entry.anchored[before_syllabification..] {
-            apply(
-                anchored,
-                &mut steps,
-                &mut persistent_cleanups,
-                &mut persistent_syllabify,
-            );
+            seq.apply_anchored(anchored);
         }
-        steps.extend(entry.steps);
+        // A non-empty entry is a real `ApplyRule` (rule/deromanizer/romanizer):
+        // emit one Rule stage spanning its steps and advance `lastRuleName`.
+        // The trailing virtual rule (empty steps) emits nothing.
+        if !entry.steps.is_empty() {
+            let start = seq.steps.len();
+            seq.steps.extend(entry.steps);
+            seq.stages.push(Stage {
+                name: entry.name.clone(),
+                kind: StageKind::Rule {
+                    steps: start..seq.steps.len(),
+                },
+            });
+            seq.last_rule_name = entry.name;
+            seq.syl_counter = 0;
+        }
     }
-    steps
+    (seq.steps, seq.stages)
+}
+
+/// Mutable state threaded through [`sequence`], so cleanup/syllabify pushes
+/// can name their stages with the current `lastRuleName` and counter.
+struct Seq {
+    steps: Vec<Step>,
+    stages: Vec<Stage>,
+    persistent_cleanups: Vec<(SmolStr, usize)>,
+    persistent_syllabify: Option<Step>,
+    last_rule_name: SmolStr,
+    syl_counter: u32,
+}
+
+impl Seq {
+    /// Push a cleanup rule application (first declaration or persistent
+    /// re-run) and its `<cleanup>/<lastRule>/<name>` stage.
+    fn push_cleanup(&mut self, name: &SmolStr, rule: usize) {
+        let start = self.steps.len();
+        self.steps.push(Step::Rule {
+            rule,
+            universe: Universe::Real,
+        });
+        self.steps.push(Step::StripBreaks);
+        self.stages.push(Stage {
+            name: SmolStr::from(format!("<cleanup>/{}/{name}", self.last_rule_name)),
+            kind: StageKind::Cleanup {
+                steps: start..self.steps.len(),
+            },
+        });
+    }
+
+    /// Push a syllabification step and its `<syllables>/<lastRule>/<n>` stage
+    /// (the counter advances on every syllabify since the last applied rule,
+    /// including persistent re-runs).
+    fn push_syllabify(&mut self, index: Option<usize>) {
+        let start = self.steps.len();
+        self.steps.push(Step::Syllabify(index));
+        self.syl_counter += 1;
+        self.stages.push(Stage {
+            name: SmolStr::from(format!(
+                "<syllables>/{}/{}",
+                self.last_rule_name, self.syl_counter
+            )),
+            kind: StageKind::Syllabify {
+                steps: start..self.steps.len(),
+            },
+        });
+    }
+
+    fn apply_anchored(&mut self, anchored: &Anchored) {
+        match anchored {
+            Anchored::Cleanup { name, rule } => {
+                self.push_cleanup(name, *rule);
+                self.persistent_cleanups.push((name.clone(), *rule));
+            }
+            Anchored::CleanupOff(name) => {
+                self.persistent_cleanups.retain(|(n, _)| n != name);
+            }
+            Anchored::Syllabify(index) => {
+                self.push_syllabify(*index);
+                self.persistent_syllabify = Some(Step::Syllabify(*index));
+            }
+            Anchored::InterRomanizer {
+                name,
+                stage_name,
+                steps,
+            } => {
+                // Side branch: no main `steps` are pushed; the romanizer's own
+                // steps are carried on the stage and run on a copy of the
+                // stream by the session.
+                self.stages.push(Stage {
+                    name: name.clone(),
+                    kind: StageKind::IntermediateRomanize {
+                        stage_name: stage_name.clone(),
+                        steps: steps.clone(),
+                    },
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -802,6 +934,12 @@ impl<'a> Lowerer<'a> {
                 // must be a plain expression list and is inlined.
                 if let [ast::Expression::BlockRef(name)] = expressions.as_slice() {
                     let rule = self.deferred_rule(name)?;
+                    // Validate the deferred body now that it's actually spliced
+                    // (kotlin compiles `defer`d rules at their reference). Nested
+                    // `:name` refs inside it recurse through here, so transitive
+                    // splices validate too.
+                    crate::parser::validate::check_deferred_rule(&rule, true)
+                        .map_err(|what| CompileError::Invalid { what })?;
                     let modifiers = self.lower_modifiers(&rule.modifiers, true)?;
                     let body = self.lower_block(&rule.block)?;
                     return wrap_with_modifiers(body, modifiers);
@@ -834,6 +972,8 @@ impl<'a> Lowerer<'a> {
             }
             ast::Expression::BlockRef(name) => {
                 let rule = self.deferred_rule(name)?;
+                crate::parser::validate::check_deferred_rule(&rule, true)
+                    .map_err(|what| CompileError::Invalid { what })?;
                 if !rule
                     .modifiers
                     .iter()

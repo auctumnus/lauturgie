@@ -24,11 +24,35 @@ exclude = [
     ".gitmodules",
 ]
 
+[features]
+# The HTTP API server binary (`lauturgie-server`), wire-compatible with
+# Lexurgy's scv1 endpoints. Off by default so the library and CLI stay
+# dependency-light; build/install it with `--features server`.
+server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:indexmap", "dep:uuid"]
+
 [dependencies]
 lalrpop-util = "0.23"
 rayon = "1.10"
 smol_str = "0.3.6"
 unicode-normalization = "0.1.25"
+
+# `server` feature only.
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+indexmap = { version = "2", features = ["serde"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+# Listed explicitly so `lauturgie-server` can carry `required-features`; the
+# default CLI bin is named here too since an explicit `[[bin]]` disables
+# auto-discovery for siblings.
+[[bin]]
+name = "lauturgie"
+
+[[bin]]
+name = "lauturgie-server"
+required-features = ["server"]
 
 [build-dependencies]
 lalrpop = { version = "0.23", default-features = false }

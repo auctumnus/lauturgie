@@ -3167,6 +3167,125 @@ impl CompiledRules {
         }
     }
 
+    /// Run a slice of [`Step`]s over one phrase (cell) on the reference VM
+    /// tier, threading the current `universe` through any `Redeclare`. This is
+    /// the per-stage primitive used by the session path ([`crate::session`]):
+    /// no FST tier, no cross-rule fusion, no skip-resyllabification — the
+    /// unoptimized reference, so its output equals `apply`'s by construction.
+    pub fn run_steps_vm(
+        &mut self,
+        steps: &[Step],
+        phrase: &mut Phrase,
+        universe: &mut Universe,
+    ) -> Result<(), RunError> {
+        for &step in steps {
+            match step {
+                Step::Rule { rule, universe: u } => {
+                    let (decls, segments) = match u {
+                        Universe::Real => (&self.decls, &mut self.segments),
+                        Universe::Literal => (&self.literal_decls, &mut self.literal_segments),
+                    };
+                    let body = &self.rules[rule].body;
+                    let mut executor = Executor::new(decls, segments);
+                    if let Some(next) = executor.run_block(body, phrase, &[])? {
+                        *phrase = next;
+                    }
+                }
+                Step::StripBreaks => {
+                    let had = phrase.words.iter().any(|w| {
+                        let b = w.syllable_breaks();
+                        b.first() == Some(&0) || b.last() == Some(&w.len())
+                    });
+                    if had {
+                        *phrase = std::mem::take(phrase).remove_bounding_breaks();
+                    }
+                }
+                Step::Syllabify(None) => {
+                    if phrase.is_syllabified() {
+                        *phrase = phrase.to_simple();
+                    }
+                }
+                Step::Syllabify(Some(si)) => {
+                    let syllabifier = &self.syllabifiers[si];
+                    let mut executor = Executor::new(&self.decls, &mut self.segments);
+                    let mut words = Vec::with_capacity(phrase.words.len());
+                    for word in &phrase.words {
+                        words.push(executor.syllabify(syllabifier, word)?);
+                    }
+                    *phrase = Phrase { words };
+                }
+                Step::Redeclare {
+                    universe: u,
+                    syllabified,
+                } => {
+                    let mut words = Vec::with_capacity(phrase.words.len());
+                    for word in &phrase.words {
+                        let rendered = match *universe {
+                            Universe::Real => render_word(&self.decls, &self.segments, word),
+                            Universe::Literal => {
+                                render_word(&self.literal_decls, &self.literal_segments, word)
+                            }
+                        };
+                        let reparsed = match u {
+                            Universe::Real => {
+                                self.segments
+                                    .parse_word(&self.decls, &rendered, syllabified)
+                            }
+                            Universe::Literal => self.literal_segments.parse_word(
+                                &self.literal_decls,
+                                &rendered,
+                                false,
+                            ),
+                        }
+                        .map_err(|e| RunError::Word(e.to_string()))?;
+                        words.push(reparsed);
+                    }
+                    *phrase = Phrase { words };
+                    *universe = u;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Render one phrase (cell) to text in the given universe, NFC-composed
+    /// exactly as `apply`'s final output.
+    pub(crate) fn render_phrase(&self, phrase: &Phrase, universe: Universe) -> String {
+        let rendered = phrase
+            .words
+            .iter()
+            .map(|word| match universe {
+                Universe::Real => render_word(&self.decls, &self.segments, word),
+                Universe::Literal => render_word(&self.literal_decls, &self.literal_segments, word),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if rendered.is_ascii() {
+            rendered
+        } else {
+            use unicode_normalization::UnicodeNormalization;
+            rendered.nfc().collect()
+        }
+    }
+
+    /// Parse one input cell (a phrase: words split on spaces) in the input
+    /// universe — lexurgy's `cell.trim().split(" ").map(parsePhonetic)`.
+    pub(crate) fn parse_cell(&mut self, cell: &str) -> Result<Phrase, RunError> {
+        let mut words = Vec::new();
+        for w in cell.trim().split(' ') {
+            let word = match self.input_universe {
+                Universe::Real => {
+                    self.segments
+                        .parse_word(&self.decls, w, self.input_syllabified)
+                }
+                Universe::Literal => self.literal_segments.parse_word(&self.literal_decls, w, false),
+            }
+            .map_err(|e| RunError::Word(e.to_string()))?;
+            words.push(word);
+        }
+        Ok(Phrase { words })
+    }
+
     /// Run many input lines in parallel, results in input order. Lines are
     /// independent (lexurgy's `SoundChanger.change` maps over cells), so
     /// each rayon worker runs on its own clone of the changer: the
@@ -3841,6 +3960,43 @@ mod tests {
 
         // …but a *plain* duplicate rule name is still rejected.
         assert!(reject("r:\n  a => b\n\nr:\n  a => c\n").contains("more than once"));
+    }
+
+    #[test]
+    fn deferred_rule_bodies_are_validated_only_when_spliced() {
+        // kotlin compiles a `defer`d rule lazily at its `:name` splice, so a
+        // never-spliced deferred rule with an invalid body is *accepted*, not
+        // rejected; spliced, the same body is rejected. (kotlin-CLI-verified:
+        // eager validation of unspliced deferred rules was all 18 of one
+        // kotlin-oracle fuzz campaign's reject-disagreement findings.) Covers
+        // both the parse-time check (peripheral repeater, `parser::validate`)
+        // and the lowering check (a matrix with two values of one feature,
+        // `compiler::lower`).
+        let decls = "feature place(lab, alv, vel)\nsymbol k [vel]\n";
+
+        // Never spliced: the invalid body is ignored and the main rule runs.
+        let periph = format!("{decls}bad defer:\n  k => y / _ k*(1-3)\nmain:\n  k => a\n");
+        assert_eq!(apply(&periph, "k"), "a");
+        let matrix = format!("{decls}bad defer:\n  [vel *place] => k\nmain:\n  k => a\n");
+        assert_eq!(apply(&matrix, "k"), "a");
+
+        // Spliced: validation runs at the reference and the rule is rejected.
+        assert!(reject(&format!(
+            "{decls}bad defer:\n  k => y / _ k*(1-3)\nmain:\n  :bad\n"
+        ))
+        .contains("meaningless at the edge"));
+        assert!(reject(&format!(
+            "{decls}bad defer:\n  [vel *place] => k\nmain:\n  :bad\n"
+        ))
+        .contains("multiple values"));
+
+        // A transforming `>` is the exception: lexurgy's `LscFutureStructure`
+        // is a compile-stage error thrown for *every* rule, so it's an eager
+        // reject even in a never-spliced deferred rule (it stays VM-only and
+        // unimplemented). `parse` still accepts it — only compile rejects.
+        assert!(reject(&format!("{decls}bad defer:\n  k => k>a\nmain:\n  k => a\n"))
+            .contains("transforming interfix"));
+        assert!(parse(&format!("{decls}bad defer:\n  k => k>a\nmain:\n  k => a\n")).is_ok());
     }
 
     // multi-word phrases (every value verified against the Kotlin CLI)
