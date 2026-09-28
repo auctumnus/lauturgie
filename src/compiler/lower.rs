@@ -374,7 +374,10 @@ impl Build {
         universe: Universe,
     ) -> Result<BlockIr, CompileError> {
         let mut lowerer = self.lowerer(universe);
-        let modifiers = lowerer.lower_modifiers(&rule.modifiers, true)?;
+        let modifiers = without_ignored_ref_mode(
+            lowerer.lower_modifiers(&rule.modifiers, true)?,
+            is_standalone_block_ref(&rule.block),
+        );
         let body = lowerer.lower_block(&rule.block)?;
         wrap_with_modifiers(body, modifiers)
     }
@@ -863,6 +866,30 @@ fn wrap_with_modifiers(body: BlockIr, m: Modifiers) -> Result<BlockIr, CompileEr
     })
 }
 
+/// Lexurgy stores the scan mode on the simple rule that contains `:name`.
+/// When that rule has only the reference, linking substitutes the referenced
+/// rule directly and never reads the containing rule's scan mode. This also
+/// holds when the reference expands to a `Then:`/`Else:` block.
+fn is_standalone_block_ref(block: &ast::Block) -> bool {
+    block.rest.is_empty() && is_standalone_block_ref_element(&block.first)
+}
+
+fn is_standalone_block_ref_element(element: &ast::BlockElement) -> bool {
+    match element {
+        ast::BlockElement::Expressions(exprs) => {
+            matches!(exprs.as_slice(), [ast::Expression::BlockRef(_)])
+        }
+        ast::BlockElement::Nested(inner) => is_standalone_block_ref(inner),
+    }
+}
+
+fn without_ignored_ref_mode(mut modifiers: Modifiers, standalone_ref: bool) -> Modifiers {
+    if standalone_ref {
+        modifiers.mode = MatchMode::Simultaneous;
+    }
+    modifiers
+}
+
 struct Lowerer<'a> {
     decls: &'a Declarations,
     segments: &'a mut SegmentInterner,
@@ -912,7 +939,10 @@ impl<'a> Lowerer<'a> {
         }
         let mut children = vec![first];
         for (block_type, element) in &block.rest {
-            let modifiers = self.lower_modifiers(&block_type.modifiers, false)?;
+            let modifiers = without_ignored_ref_mode(
+                self.lower_modifiers(&block_type.modifiers, false)?,
+                is_standalone_block_ref_element(element),
+            );
             let child = self.lower_block_element(element)?;
             children.push(wrap_with_modifiers(child, modifiers)?);
         }
@@ -940,7 +970,10 @@ impl<'a> Lowerer<'a> {
                     // splices validate too.
                     crate::parser::validate::check_deferred_rule(&rule, true)
                         .map_err(|what| CompileError::Invalid { what })?;
-                    let modifiers = self.lower_modifiers(&rule.modifiers, true)?;
+                    let modifiers = without_ignored_ref_mode(
+                        self.lower_modifiers(&rule.modifiers, true)?,
+                        is_standalone_block_ref(&rule.block),
+                    );
                     let body = self.lower_block(&rule.block)?;
                     return wrap_with_modifiers(body, modifiers);
                 }

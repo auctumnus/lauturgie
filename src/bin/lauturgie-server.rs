@@ -35,10 +35,6 @@ use tokio::sync::Notify;
 use lauturgie::compiler::{self, CompileError, CompiledRules};
 use lauturgie::session::ChangeOptions;
 
-// ---------------------------------------------------------------------------
-// Wire types (JSON shapes mirror lexurgy's kotlinx-serialized data classes).
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct ScRequest {
     changes: String,
@@ -156,10 +152,6 @@ impl IntoResponse for ScResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server state, background jobs.
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy)]
 struct Timeouts {
     request: f64,
@@ -178,10 +170,6 @@ struct AppState {
     timeouts: Timeouts,
     api_key: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Compile + run.
-// ---------------------------------------------------------------------------
 
 /// Compile a `.lsc` source, mapping failures to the API's error shapes.
 fn compile_changes(changes: &str) -> Result<CompiledRules, ErrorBody> {

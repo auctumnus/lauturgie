@@ -3947,6 +3947,33 @@ mod tests {
     }
 
     #[test]
+    fn standalone_deferred_reference_ignores_outer_scan_mode() {
+        // Lexurgy's singleton-reference link replaces the containing simple
+        // rule, so its ltr/rtl mode is discarded even for a complex block.
+        let simple = "spread defer:\n  a => b / b _\n\
+                      run ltr:\n  :spread\n";
+        assert_eq!(apply(simple, "baa"), "bba");
+
+        let complex = "spread defer:\n  a => b / b _\n\
+                       Then:\n  b => c\n\
+                       run ltr:\n  :spread\n";
+        assert_eq!(apply(complex, "baa"), "cca");
+
+        let arm = "spread defer:\n  a => b / b _\n\
+                   run:\n  a => a\n\
+                   Then ltr:\n  :spread\n";
+        assert_eq!(apply(arm, "baa"), "bba");
+
+        let nested = "spread defer:\n  a => b / b _\n\
+                      alias defer ltr:\n  :spread\n\
+                      run:\n  :alias\n";
+        assert_eq!(apply(nested, "baa"), "bba");
+
+        // A directional modifier still applies to an ordinary expression.
+        assert_eq!(apply("run ltr:\n  a => b / b _\n", "baa"), "bbb");
+    }
+
+    #[test]
     fn duplicate_deferred_rule_names_keep_the_last() {
         // Unlike *plain* rules (kotlin rejects a duplicate name,
         // `duplicate_declarations_are_rejected`), a redeclared `defer`d rule
